@@ -1,0 +1,33 @@
+#!/bin/sh
+
+# Questo script viene eseguito UNA SOLA VOLTA dopo l'installazione
+# del pacchetto, al primo boot o quando si esegue /etc/init.d/boot
+
+# === CREA FILE DI CONFIGURAZIONE UCI ===
+# Se /etc/config/mullvadvpn non esiste, lo creiamo con valori di default
+
+if [ ! -f /etc/config/mullvadvpn ]; then
+    # Crea un file vuoto
+    touch /etc/config/mullvadvpn
+
+    # Aggiungi la sezione globale con le impostazioni di default
+    # 'globals' e' il nome della sezione, 'mullvadvpn' e' il tipo
+    uci set mullvadvpn.globals=mullvadvpn
+    uci set mullvadvpn.globals.enabled='1'
+    uci set mullvadvpn.globals.servers_cache_path='/etc/mullvadvpn/servers.json'
+    uci set mullvadvpn.globals.last_server_refresh='0'
+
+    # Salva le modifiche nel file
+    uci commit mullvadvpn
+fi
+
+# === CREA DIRECTORY PER CACHE SERVER ===
+# Qui verra' salvato il JSON con la lista dei server Mullvad
+mkdir -p /etc/mullvadvpn
+
+# === AUTO-RIMOZIONE ===
+# Convenzione OpenWrt: lo script si elimina dopo l'esecuzione
+# per non essere rieseguito ai prossimi boot
+rm -f /etc/uci-defaults/luci-app-mullvadvpn
+
+exit 0

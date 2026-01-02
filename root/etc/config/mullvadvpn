@@ -1,0 +1,8 @@
+# Mullvad VPN Configuration
+# This file is auto-populated by /etc/uci-defaults/luci-app-mullvadvpn
+# on first boot after package installation.
+
+config mullvadvpn 'globals'
+	option enabled '1'
+	option servers_cache_path '/etc/mullvadvpn/servers.json'
+	option last_server_refresh '0'

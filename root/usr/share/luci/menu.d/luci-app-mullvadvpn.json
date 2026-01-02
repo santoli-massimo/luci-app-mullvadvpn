@@ -1,0 +1,34 @@
+{
+	"admin/vpn": {
+		"title": "VPN",
+		"order": 90,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/vpn/mullvadvpn": {
+		"title": "Mullvad",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "mullvadvpn/overview"
+		},
+		"depends": {
+			"acl": ["luci-app-mullvadvpn"],
+			"uci": {
+				"mullvadvpn": true
+			}
+		}
+	},
+	"admin/vpn/mullvadvpn/wizard": {
+		"title": "Setup",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "mullvadvpn/wizard"
+		},
+		"depends": {
+			"acl": ["luci-app-mullvadvpn"]
+		}
+	}
+}

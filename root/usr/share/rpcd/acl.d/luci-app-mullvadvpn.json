@@ -1,0 +1,62 @@
+{
+	"luci-app-mullvadvpn": {
+		"description": "Grant access for Mullvad VPN device routing management",
+
+		"read": {
+			"ubus": {
+				"luci.mullvadvpn": [
+					"getTunnels",
+					"getDevices",
+					"getOnlineHosts",
+					"getServers",
+					"getServersList",
+					"getWireGuardInterfaces"
+				],
+				"network.interface": [
+					"status",
+					"dump"
+				],
+				"file": [
+					"list",
+					"read"
+				]
+			},
+			"uci": [
+				"mullvadvpn",
+				"network",
+				"pbr",
+				"dhcp"
+			],
+			"file": {
+				"/etc/mullvadvpn/servers.json": ["read"],
+				"/tmp/dhcp.leases": ["read"],
+				"/proc/net/arp": ["read"]
+			}
+		},
+
+		"write": {
+			"ubus": {
+				"luci.mullvadvpn": [
+					"refreshServers",
+					"setTunnelServer",
+					"detectTunnelServer",
+					"applyChanges",
+					"createTunnel",
+					"deleteTunnel",
+					"updateTunnel",
+					"addDevice",
+					"deleteDevice",
+					"updateDevice"
+				]
+			},
+			"uci": [
+				"mullvadvpn",
+				"network",
+				"pbr"
+			],
+			"file": {
+				"/etc/mullvadvpn/servers.json": ["write"]
+			}
+		}
+	}
+}
