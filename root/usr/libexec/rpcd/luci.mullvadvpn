@@ -1,0 +1,1280 @@
+#!/bin/sh
+
+# ============================================================================
+# LUCI.MULLVADVPN - RPC backend for VPN tunnel and device routing management
+# ============================================================================
+#
+# This script is invoked by rpcd (RPC daemon) to handle calls
+# from the LuCI JavaScript frontend.
+#
+# Usage:
+#   luci.mullvadvpn list              → List available methods (JSON)
+#   luci.mullvadvpn call <method>     → Execute method, read params from stdin
+#
+# ============================================================================
+
+# === DEPENDENCIES ===
+# functions.sh: UCI utilities (config_load, config_get, config_foreach, etc.)
+# jshn.sh: JSON utilities (json_init, json_add_*, json_dump, etc.)
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+# === CONSTANTS ===
+SERVERS_CACHE="/etc/mullvadvpn/servers.json"
+MULLVAD_API="https://api.mullvad.net/public/relays/wireguard/v1/"
+PBR_POLICY_PREFIX="mvpn_"
+
+# === UTILITY: Logging ===
+log_debug() {
+    logger -t "luci.mullvadvpn" -p daemon.debug "$1"
+}
+
+log_error() {
+    logger -t "luci.mullvadvpn" -p daemon.err "$1"
+}
+
+# === UTILITY: Regenerate PBR policies ===
+# Idempotent: deletes all mvpn_* policies and recreates them from config
+regenerate_pbr() {
+    # Remove existing policies with mvpn_ prefix
+    local section
+    for section in $(uci show pbr 2>/dev/null | grep "\.name='mvpn_" | cut -d. -f2 | cut -d= -f1); do
+        uci -q delete pbr.$section
+    done
+
+    # Load config
+    config_load mullvadvpn
+
+    local count=0
+
+    # Iterate over all devices using uci show (more reliable than config_foreach in this context)
+    local devices=$(uci show mullvadvpn 2>/dev/null | grep "=device$" | cut -d. -f2 | cut -d= -f1)
+    for device in $devices; do
+        local mac tunnel enabled wg_interface tunnel_enabled
+
+        config_get mac "$device" mac ""
+        config_get tunnel "$device" tunnel ""
+        config_get enabled "$device" enabled "1"
+
+        [ -z "$mac" ] || [ -z "$tunnel" ] || [ "$enabled" != "1" ] && continue
+
+        config_get wg_interface "$tunnel" wg_interface ""
+        [ -z "$wg_interface" ] && continue
+
+        config_get tunnel_enabled "$tunnel" enabled "1"
+        [ "$tunnel_enabled" != "1" ] && continue
+
+        # Create policy
+        local policy_name="mvpn_$(echo "$mac" | tr -d ':' | tr '[:upper:]' '[:lower:]')"
+        uci set pbr.${policy_name}=policy
+        uci set pbr.${policy_name}.name="$policy_name"
+        uci set pbr.${policy_name}.interface="$wg_interface"
+        uci set pbr.${policy_name}.src_addr="$mac"
+        uci set pbr.${policy_name}.enabled="1"
+
+        count=$((count + 1))
+    done
+
+    uci commit pbr
+
+    # Reload PBR
+    [ -x /etc/init.d/pbr ] && /etc/init.d/pbr reload >/dev/null 2>&1
+
+    log_debug "Regenerated $count PBR policies"
+}
+
+# === UTILITY: Error JSON output ===
+json_output_error() {
+    json_init
+    json_add_boolean "success" 0
+    json_add_string "error" "$1"
+    json_dump
+    json_cleanup
+}
+
+# === UTILITY: Success JSON output ===
+json_output_success() {
+    json_init
+    json_add_boolean "success" 1
+    json_add_string "message" "$1"
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: getTunnels
+# Returns the list of configured tunnels with WireGuard interface status
+# ============================================================================
+get_tunnels() {
+    json_init
+    json_add_array "tunnels"
+
+    # Load mullvadvpn configuration
+    config_load mullvadvpn
+
+    # For each section of type 'tunnel', add to JSON
+    config_foreach _add_tunnel_to_json tunnel
+
+    json_close_array
+    json_dump
+    json_cleanup
+}
+
+_add_tunnel_to_json() {
+    local section="$1"
+    local label wg_interface enabled
+
+    # Read options from the UCI section
+    config_get label "$section" label "Unnamed Tunnel"
+    config_get wg_interface "$section" wg_interface ""
+    config_get enabled "$section" enabled "1"
+
+    # === READ THE TRUTH FROM THE WIREGUARD PEER ===
+    local peer_endpoint_host=""
+    local real_server="" real_country="" real_country_name="" real_city="" real_city_name=""
+
+    if [ -n "$wg_interface" ]; then
+        # Read the endpoint configured on the peer (the truth)
+        peer_endpoint_host=$(uci -q get network.@wireguard_${wg_interface}[0].endpoint_host)
+
+        # If we have the server cache, resolve IP -> Mullvad server
+        if [ -n "$peer_endpoint_host" ] && [ -f "$SERVERS_CACHE" ] && [ -s "$SERVERS_CACHE" ]; then
+            real_server=$(jsonfilter -i "$SERVERS_CACHE" \
+                -e "@.countries[*].cities[*].relays[@.ipv4_addr_in='$peer_endpoint_host'].hostname" 2>/dev/null | head -1)
+
+            if [ -n "$real_server" ]; then
+                real_country=$(jsonfilter -i "$SERVERS_CACHE" \
+                    -e "@.countries[@.cities[*].relays[@.hostname='$real_server']].code" 2>/dev/null | head -1)
+                real_country_name=$(jsonfilter -i "$SERVERS_CACHE" \
+                    -e "@.countries[@.cities[*].relays[@.hostname='$real_server']].name" 2>/dev/null | head -1)
+                real_city=$(jsonfilter -i "$SERVERS_CACHE" \
+                    -e "@.countries[*].cities[@.relays[@.hostname='$real_server']].code" 2>/dev/null | head -1)
+                real_city_name=$(jsonfilter -i "$SERVERS_CACHE" \
+                    -e "@.countries[*].cities[@.relays[@.hostname='$real_server']].name" 2>/dev/null | head -1)
+            fi
+        fi
+    fi
+
+    # Check WireGuard interface status
+    local wg_status="unknown"
+    local wg_endpoint=""
+    local wg_handshake=""
+
+    if [ -n "$wg_interface" ]; then
+        if wg show "$wg_interface" >/dev/null 2>&1; then
+            wg_status="up"
+            wg_endpoint=$(wg show "$wg_interface" endpoints 2>/dev/null | awk '{print $2}' | head -1)
+            wg_handshake=$(wg show "$wg_interface" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+        else
+            if uci -q get network."$wg_interface" >/dev/null 2>&1; then
+                wg_status="down"
+            else
+                wg_status="missing"
+            fi
+        fi
+    fi
+
+    # Add tunnel object to the JSON array
+    # Show the TRUTH (from the peer), not the metadata
+    json_add_object
+    json_add_string "id" "$section"
+    json_add_string "label" "$label"
+    json_add_string "wg_interface" "$wg_interface"
+    json_add_boolean "enabled" "$enabled"
+    json_add_string "peer_endpoint" "$peer_endpoint_host"
+    json_add_string "current_server" "$real_server"
+    json_add_string "current_country" "$real_country"
+    json_add_string "current_country_name" "$real_country_name"
+    json_add_string "current_city" "$real_city"
+    json_add_string "current_city_name" "$real_city_name"
+    json_add_string "wg_status" "$wg_status"
+    json_add_string "wg_endpoint" "$wg_endpoint"
+    json_add_string "wg_handshake" "$wg_handshake"
+    json_close_object
+}
+
+# ============================================================================
+# METHOD: getDevices
+# Returns the list of devices configured for VPN routing
+# ============================================================================
+get_devices() {
+    json_init
+    json_add_array "devices"
+
+    config_load mullvadvpn
+    config_foreach _add_device_to_json device
+
+    json_close_array
+    json_dump
+    json_cleanup
+}
+
+_add_device_to_json() {
+    local section="$1"
+    local mac label tunnel enabled dns_override
+
+    config_get mac "$section" mac ""
+    config_get label "$section" label ""
+    config_get tunnel "$section" tunnel ""
+    config_get enabled "$section" enabled "1"
+    config_get dns_override "$section" dns_override ""
+
+    # If label is empty, use MAC as fallback
+    [ -z "$label" ] && label="$mac"
+
+    json_add_object
+    json_add_string "id" "$section"
+    json_add_string "mac" "$mac"
+    json_add_string "label" "$label"
+    json_add_string "tunnel" "$tunnel"
+    json_add_boolean "enabled" "$enabled"
+    json_add_string "dns_override" "$dns_override"
+    json_close_object
+}
+
+# ============================================================================
+# METHOD: getOnlineHosts
+# Returns the list of currently online hosts (from DHCP leases + ARP)
+# Useful for discovering devices to add
+# ============================================================================
+get_online_hosts() {
+    json_init
+    json_add_array "hosts"
+
+    local seen_macs=""
+
+    # === Source 1: DHCP Leases ===
+    # File /tmp/dhcp.leases contains: timestamp mac ip hostname clientid
+    if [ -f /tmp/dhcp.leases ]; then
+        while IFS=' ' read -r expire mac ip hostname clientid; do
+            # Skip empty or invalid lines
+            [ -z "$mac" ] && continue
+            # Normalize MAC to lowercase
+            mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+            # Avoid duplicates
+            case "$seen_macs" in
+                *"$mac"*) continue ;;
+            esac
+            seen_macs="$seen_macs $mac"
+
+            # Hostname can be '*' if not provided
+            [ "$hostname" = "*" ] && hostname=""
+
+            json_add_object
+            json_add_string "mac" "$mac"
+            json_add_string "ip" "$ip"
+            json_add_string "hostname" "$hostname"
+            json_add_string "source" "dhcp"
+            json_close_object
+        done < /tmp/dhcp.leases
+    fi
+
+    # === Source 2: ARP Table ===
+    # For devices that don't use DHCP but are on the network anyway
+    if [ -f /proc/net/arp ]; then
+        # Skip first line (header)
+        tail -n +2 /proc/net/arp | while IFS=' ' read -r ip _ _ mac _ iface; do
+            # Skip incomplete entries
+            [ "$mac" = "00:00:00:00:00:00" ] && continue
+            [ -z "$mac" ] && continue
+            mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+            # Avoid duplicates with DHCP
+            case "$seen_macs" in
+                *"$mac"*) continue ;;
+            esac
+
+            json_add_object
+            json_add_string "mac" "$mac"
+            json_add_string "ip" "$ip"
+            json_add_string "hostname" ""
+            json_add_string "source" "arp"
+            json_close_object
+        done
+    fi
+
+    json_close_array
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: getWireGuardInterfaces
+# Returns the list of WireGuard interfaces configured in /etc/config/network
+# ============================================================================
+get_wireguard_interfaces() {
+    json_init
+    json_add_array "interfaces"
+
+    config_load network
+
+    # Look for interface sections with proto='wireguard'
+    config_foreach _add_wg_interface_to_json interface
+
+    json_close_array
+    json_dump
+    json_cleanup
+}
+
+_add_wg_interface_to_json() {
+    local section="$1"
+    local proto
+
+    config_get proto "$section" proto ""
+
+    # WireGuard interfaces only
+    [ "$proto" = "wireguard" ] || return
+
+    local private_key addresses
+
+    config_get private_key "$section" private_key ""
+    config_get addresses "$section" addresses ""
+
+    # Check whether it's already associated with a tunnel using uci directly
+    local associated_tunnel=""
+    associated_tunnel=$(uci show mullvadvpn 2>/dev/null | grep "\.wg_interface='$section'" | cut -d. -f2 | head -1)
+
+    json_add_object
+    json_add_string "name" "$section"
+    json_add_boolean "has_private_key" "$([ -n "$private_key" ] && echo 1 || echo 0)"
+    json_add_string "addresses" "$addresses"
+    json_add_string "associated_tunnel" "$associated_tunnel"
+    json_close_object
+}
+
+# ============================================================================
+# METHOD: getServers
+# Returns the Mullvad server cache
+# ============================================================================
+get_servers() {
+    json_init
+
+    if [ ! -f "$SERVERS_CACHE" ] || [ ! -s "$SERVERS_CACHE" ]; then
+        json_add_boolean "cache_empty" 1
+        json_add_string "cache_path" "$SERVERS_CACHE"
+        json_add_array "countries"
+        json_close_array
+    else
+        # Cache exists, return the content directly
+        # (it's already valid JSON from the Mullvad API)
+        json_add_boolean "cache_empty" 0
+        json_add_string "cache_path" "$SERVERS_CACHE"
+
+        # Read last refresh timestamp
+        local last_refresh
+        config_load mullvadvpn
+        config_get last_refresh globals last_server_refresh "0"
+        json_add_int "last_refresh" "$last_refresh"
+    fi
+
+    json_dump
+    json_cleanup
+
+    # If the cache exists, also print the raw content for client-side parsing
+    if [ -f "$SERVERS_CACHE" ] && [ -s "$SERVERS_CACHE" ]; then
+        # The client will have to make a second call or parse this
+        :
+    fi
+}
+
+# ============================================================================
+# METHOD: getServersList
+# Returns the raw content of the server cache (Mullvad JSON)
+# ============================================================================
+get_servers_list() {
+    if [ -f "$SERVERS_CACHE" ] && [ -s "$SERVERS_CACHE" ]; then
+        cat "$SERVERS_CACHE"
+    else
+        echo '{"countries":[]}'
+    fi
+}
+
+# ============================================================================
+# METHOD: refreshServers
+# Downloads the server list from the Mullvad API and updates the cache
+# ============================================================================
+refresh_servers() {
+    json_init
+
+    local tmp_file="/tmp/mullvad_servers_$$.json"
+
+    # Try wget first (more common on OpenWrt)
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q -O "$tmp_file" --timeout=30 "$MULLVAD_API" 2>/dev/null; then
+            :
+        else
+            rm -f "$tmp_file"
+            json_add_boolean "success" 0
+            json_add_string "error" "Failed to download server list (wget)"
+            json_dump
+            json_cleanup
+            return
+        fi
+    # Fallback to curl
+    elif command -v curl >/dev/null 2>&1; then
+        if curl -s -o "$tmp_file" --connect-timeout 30 "$MULLVAD_API" 2>/dev/null; then
+            :
+        else
+            rm -f "$tmp_file"
+            json_add_boolean "success" 0
+            json_add_string "error" "Failed to download server list (curl)"
+            json_dump
+            json_cleanup
+            return
+        fi
+    else
+        json_add_boolean "success" 0
+        json_add_string "error" "No wget or curl available"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check that the downloaded file is valid JSON
+    if [ ! -s "$tmp_file" ]; then
+        rm -f "$tmp_file"
+        json_add_boolean "success" 0
+        json_add_string "error" "Downloaded file is empty"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check JSON structure (must have 'countries')
+    if ! jsonfilter -i "$tmp_file" -e '@.countries' >/dev/null 2>&1; then
+        rm -f "$tmp_file"
+        json_add_boolean "success" 0
+        json_add_string "error" "Invalid JSON structure from API"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # All good, move to cache
+    mkdir -p "$(dirname "$SERVERS_CACHE")"
+    mv "$tmp_file" "$SERVERS_CACHE"
+
+    # Update timestamp
+    local now=$(date +%s)
+    uci set mullvadvpn.globals.last_server_refresh="$now"
+    uci commit mullvadvpn
+
+    # Count servers for feedback
+    local country_count=$(jsonfilter -i "$SERVERS_CACHE" -e '@.countries[*]' 2>/dev/null | wc -l)
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Server list updated"
+    json_add_int "countries" "$country_count"
+    json_add_int "timestamp" "$now"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: createTunnel
+# Creates a new tunnel associated with a WireGuard interface
+# ============================================================================
+create_tunnel() {
+    # Read parameters from stdin (JSON)
+    local input
+    read -r input
+
+    local label wg_interface
+    label=$(echo "$input" | jsonfilter -e '@.label' 2>/dev/null)
+    wg_interface=$(echo "$input" | jsonfilter -e '@.wg_interface' 2>/dev/null)
+
+    json_init
+
+    # Validation
+    if [ -z "$wg_interface" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "WireGuard interface is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check that the interface exists
+    config_load network
+    local proto
+    config_get proto "$wg_interface" proto ""
+    if [ "$proto" != "wireguard" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Interface '$wg_interface' is not a WireGuard interface"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check if already associated - if so, reuse the existing tunnel
+    config_load mullvadvpn
+    local existing=""
+    config_foreach _find_tunnel_by_interface tunnel "$wg_interface"
+    if [ -n "$existing" ]; then
+        # Already associated: update label if provided and return success
+        if [ -n "$label" ]; then
+            uci set mullvadvpn."$existing".label="$label"
+            uci commit mullvadvpn
+        fi
+        json_add_boolean "success" 1
+        json_add_string "tunnel_id" "$existing"
+        json_add_string "message" "Using existing tunnel"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Tunnel ID based on the interface name (stable and unique)
+    local tunnel_id="tunnel_${wg_interface}"
+
+    # Use the provided label or generate one from the interface name
+    [ -z "$label" ] && label="Tunnel $wg_interface"
+
+    # Create tunnel section in UCI (reference only, does NOT modify WireGuard config)
+    uci set mullvadvpn."$tunnel_id"=tunnel
+    uci set mullvadvpn."$tunnel_id".label="$label"
+    uci set mullvadvpn."$tunnel_id".wg_interface="$wg_interface"
+    uci set mullvadvpn."$tunnel_id".enabled="1"
+    uci set mullvadvpn."$tunnel_id".current_server=""
+    uci set mullvadvpn."$tunnel_id".current_country=""
+    uci set mullvadvpn."$tunnel_id".current_city=""
+    uci commit mullvadvpn
+
+    log_debug "Created tunnel $tunnel_id for interface $wg_interface"
+
+    json_add_boolean "success" 1
+    json_add_string "tunnel_id" "$tunnel_id"
+    json_add_string "message" "Tunnel created successfully"
+
+    json_dump
+    json_cleanup
+}
+
+_find_tunnel_by_interface() {
+    local section="$1"
+    local target="$2"
+    local iface
+    config_get iface "$section" wg_interface ""
+    if [ "$iface" = "$target" ]; then
+        existing="$section"
+    fi
+}
+
+# ============================================================================
+# METHOD: updateTunnel
+# Updates the label or enabled state of a tunnel
+# ============================================================================
+update_tunnel() {
+    local input
+    read -r input
+
+    local tunnel_id label enabled
+    tunnel_id=$(echo "$input" | jsonfilter -e '@.tunnel_id' 2>/dev/null)
+    label=$(echo "$input" | jsonfilter -e '@.label' 2>/dev/null)
+    enabled=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$tunnel_id" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "tunnel_id is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check tunnel existence
+    config_load mullvadvpn
+    local tunnel_type
+    tunnel_type=$(uci -q get mullvadvpn."$tunnel_id")
+    if [ "$tunnel_type" != "tunnel" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Tunnel not found"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Update provided fields
+    [ -n "$label" ] && uci set mullvadvpn."$tunnel_id".label="$label"
+    [ -n "$enabled" ] && uci set mullvadvpn."$tunnel_id".enabled="$enabled"
+    uci commit mullvadvpn
+    regenerate_pbr
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Tunnel updated"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: deleteTunnel
+# Deletes a tunnel (does not delete the underlying WireGuard interface)
+# ============================================================================
+delete_tunnel() {
+    local input
+    read -r input
+
+    local tunnel_id
+    tunnel_id=$(echo "$input" | jsonfilter -e '@.tunnel_id' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$tunnel_id" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "tunnel_id is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check existence
+    if ! uci -q get mullvadvpn."$tunnel_id" >/dev/null 2>&1; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Tunnel not found"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Delete devices associated with this tunnel
+    config_load mullvadvpn
+    config_foreach _delete_device_if_tunnel device "$tunnel_id"
+
+    # Delete tunnel
+    uci delete mullvadvpn."$tunnel_id"
+    uci commit mullvadvpn
+    regenerate_pbr
+
+    log_debug "Deleted tunnel $tunnel_id"
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Tunnel deleted"
+
+    json_dump
+    json_cleanup
+}
+
+_delete_device_if_tunnel() {
+    local section="$1"
+    local target_tunnel="$2"
+    local device_tunnel
+    config_get device_tunnel "$section" tunnel ""
+    if [ "$device_tunnel" = "$target_tunnel" ]; then
+        uci delete mullvadvpn."$section"
+        log_debug "Deleted device $section (was assigned to tunnel $target_tunnel)"
+    fi
+}
+
+# ============================================================================
+# METHOD: setTunnelServer
+# Changes the Mullvad server for a tunnel (modifies the WireGuard peer)
+# ============================================================================
+set_tunnel_server() {
+    local input
+    read -r input
+
+    local tunnel_id server_hostname
+    tunnel_id=$(echo "$input" | jsonfilter -e '@.tunnel_id' 2>/dev/null)
+    server_hostname=$(echo "$input" | jsonfilter -e '@.server_hostname' 2>/dev/null)
+
+    json_init
+
+    # Parameter validation
+    if [ -z "$tunnel_id" ] || [ -z "$server_hostname" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "tunnel_id and server_hostname are required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check tunnel existence
+    config_load mullvadvpn
+    local wg_interface
+    config_get wg_interface "$tunnel_id" wg_interface ""
+    if [ -z "$wg_interface" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Tunnel not found or has no WireGuard interface"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check server cache
+    if [ ! -f "$SERVERS_CACHE" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Server cache not available. Please refresh server list first."
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Look up server in the cache
+    # The Mullvad API structure is: countries[].cities[].relays[]
+    local server_data
+    server_data=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[*].relays[@.hostname='$server_hostname']" 2>/dev/null | head -1)
+
+    if [ -z "$server_data" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Server '$server_hostname' not found in cache"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Extract server data
+    local public_key ipv4_addr country_code city_code
+    public_key=$(echo "$server_data" | jsonfilter -e '@.public_key' 2>/dev/null)
+    ipv4_addr=$(echo "$server_data" | jsonfilter -e '@.ipv4_addr_in' 2>/dev/null)
+
+    if [ -z "$public_key" ] || [ -z "$ipv4_addr" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Could not extract server details"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Find country and city info from the path
+    # This requires a more complex lookup
+    country_code=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[@.cities[*].relays[@.hostname='$server_hostname']].code" 2>/dev/null | head -1)
+    country_name=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[@.cities[*].relays[@.hostname='$server_hostname']].name" 2>/dev/null | head -1)
+    city_code=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[@.relays[@.hostname='$server_hostname']].code" 2>/dev/null | head -1)
+    city_name=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[@.relays[@.hostname='$server_hostname']].name" 2>/dev/null | head -1)
+
+    # Find the WireGuard peer section in /etc/config/network
+    # Peers have section name 'wireguard_<interface>'
+    local peer_section=""
+    config_load network
+    config_foreach _find_wg_peer "wireguard_${wg_interface}"
+
+    # If not found by specific name, search generically
+    if [ -z "$peer_section" ]; then
+        # It might be an anonymous section
+        local found=0
+        for s in $(uci show network 2>/dev/null | grep "=wireguard_${wg_interface}" | cut -d. -f2 | cut -d= -f1); do
+            peer_section="$s"
+            found=1
+            break
+        done
+
+        if [ $found -eq 0 ]; then
+            json_add_boolean "success" 0
+            json_add_string "error" "WireGuard peer section not found for interface '$wg_interface'"
+            json_dump
+            json_cleanup
+            return
+        fi
+    fi
+
+    log_debug "Resolved server $server_hostname for tunnel $tunnel_id"
+
+    # Return the data - the frontend will save to UCI
+    # The WireGuard change will happen in the init script after Save & Apply
+    json_add_boolean "success" 1
+    json_add_string "tunnel_id" "$tunnel_id"
+    json_add_string "wg_interface" "$wg_interface"
+    json_add_string "peer_section" "$peer_section"
+    json_add_string "server_hostname" "$server_hostname"
+    json_add_string "public_key" "$public_key"
+    json_add_string "endpoint_host" "$ipv4_addr"
+    json_add_string "endpoint_port" "51820"
+    json_add_string "country_code" "$country_code"
+    json_add_string "country_name" "$country_name"
+    json_add_string "city_code" "$city_code"
+    json_add_string "city_name" "$city_name"
+
+    json_dump
+    json_cleanup
+}
+
+_find_wg_peer() {
+    local section="$1"
+    peer_section="$section"
+}
+
+# ============================================================================
+# METHOD: detectTunnelServer
+# Detects the configured Mullvad server by reading the WireGuard peer
+# and matching the endpoint IP against the server cache
+# ============================================================================
+detect_tunnel_server() {
+    local input
+    read -r input
+
+    local tunnel_id save_to_uci
+    tunnel_id=$(echo "$input" | jsonfilter -e '@.tunnel_id' 2>/dev/null)
+    save_to_uci=$(echo "$input" | jsonfilter -e '@.save' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$tunnel_id" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "tunnel_id is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Get the WG interface from the tunnel
+    config_load mullvadvpn
+    local wg_interface
+    config_get wg_interface "$tunnel_id" wg_interface ""
+
+    if [ -z "$wg_interface" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Tunnel not found or has no WireGuard interface"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Look for the WireGuard peer in /etc/config/network
+    # Peers are anonymous sections of type wireguard_<interface>
+    local endpoint_host=""
+
+    # Use direct uci get for anonymous sections
+    endpoint_host=$(uci -q get network.@wireguard_${wg_interface}[0].endpoint_host)
+
+    if [ -z "$endpoint_host" ]; then
+        json_add_boolean "success" 0
+        json_add_boolean "detected" 0
+        json_add_string "error" "No WireGuard peer found or no endpoint configured"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check server cache
+    if [ ! -f "$SERVERS_CACHE" ] || [ ! -s "$SERVERS_CACHE" ]; then
+        json_add_boolean "success" 0
+        json_add_boolean "detected" 0
+        json_add_string "error" "Server cache not available"
+        json_add_string "detected_ip" "$endpoint_host"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Look up the server with this IP in the cache
+    # The Mullvad API uses ipv4_addr_in for the endpoint
+    local server_hostname=""
+    local country_code="" country_name=""
+    local city_code="" city_name=""
+
+    # Look for the relay with this IP
+    server_hostname=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[*].relays[@.ipv4_addr_in='$endpoint_host'].hostname" 2>/dev/null | head -1)
+
+    if [ -z "$server_hostname" ]; then
+        # Not found - could be a non-Mullvad server or a changed IP
+        json_add_boolean "success" 1
+        json_add_boolean "detected" 0
+        json_add_string "detected_ip" "$endpoint_host"
+        json_add_string "message" "Endpoint IP not found in Mullvad server list"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Found! Extract full info
+    country_code=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[@.cities[*].relays[@.hostname='$server_hostname']].code" 2>/dev/null | head -1)
+    country_name=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[@.cities[*].relays[@.hostname='$server_hostname']].name" 2>/dev/null | head -1)
+    city_code=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[@.relays[@.hostname='$server_hostname']].code" 2>/dev/null | head -1)
+    city_name=$(jsonfilter -i "$SERVERS_CACHE" \
+        -e "@.countries[*].cities[@.relays[@.hostname='$server_hostname']].name" 2>/dev/null | head -1)
+
+    # If requested, save to UCI
+    if [ "$save_to_uci" = "true" ] || [ "$save_to_uci" = "1" ]; then
+        uci set mullvadvpn."$tunnel_id".current_server="$server_hostname"
+        uci set mullvadvpn."$tunnel_id".current_country="$country_code"
+        uci set mullvadvpn."$tunnel_id".current_country_name="$country_name"
+        uci set mullvadvpn."$tunnel_id".current_city="$city_code"
+        uci set mullvadvpn."$tunnel_id".current_city_name="$city_name"
+        uci commit mullvadvpn
+        log_debug "Auto-detected and saved server $server_hostname for tunnel $tunnel_id"
+    fi
+
+    json_add_boolean "success" 1
+    json_add_boolean "detected" 1
+    json_add_string "server_hostname" "$server_hostname"
+    json_add_string "country_code" "$country_code"
+    json_add_string "country_name" "$country_name"
+    json_add_string "city_code" "$city_code"
+    json_add_string "city_name" "$city_name"
+    json_add_string "endpoint_ip" "$endpoint_host"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: addDevice
+# Adds a device (MAC) to the configuration for VPN routing
+# ============================================================================
+add_device() {
+    local input
+    read -r input
+
+    local mac label
+    mac=$(echo "$input" | jsonfilter -e '@.mac' 2>/dev/null)
+    label=$(echo "$input" | jsonfilter -e '@.label' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$mac" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "MAC address is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Normalize MAC: lowercase, with colons
+    mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]' | tr '-' ':')
+
+    # Validate MAC format
+    if ! echo "$mac" | grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Invalid MAC address format"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Create section ID from MAC (without colons for a valid UCI name)
+    local device_id="device_$(echo "$mac" | tr -d ':')"
+
+    # Check if it already exists
+    if uci -q get mullvadvpn."$device_id" >/dev/null 2>&1; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Device with this MAC already exists"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # If label not provided, look up hostname from DHCP
+    if [ -z "$label" ]; then
+        label=$(grep -i "$mac" /tmp/dhcp.leases 2>/dev/null | awk '{print $4}' | head -1)
+        [ "$label" = "*" ] && label=""
+        [ -z "$label" ] && label="$mac"
+    fi
+
+    # Create device section
+    uci set mullvadvpn."$device_id"=device
+    uci set mullvadvpn."$device_id".mac="$mac"
+    uci set mullvadvpn."$device_id".label="$label"
+    uci set mullvadvpn."$device_id".tunnel=""
+    uci set mullvadvpn."$device_id".enabled="1"
+    uci set mullvadvpn."$device_id".dns_override=""
+    uci commit mullvadvpn
+    regenerate_pbr
+
+    log_debug "Added device $device_id ($mac) - $label"
+
+    json_add_boolean "success" 1
+    json_add_string "device_id" "$device_id"
+    json_add_string "message" "Device added"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: updateDevice
+# Updates device configuration (tunnel, enabled, label, dns)
+# ============================================================================
+update_device() {
+    local input
+    read -r input
+
+    local device_id tunnel enabled label dns_override
+    device_id=$(echo "$input" | jsonfilter -e '@.device_id' 2>/dev/null)
+    tunnel=$(echo "$input" | jsonfilter -e '@.tunnel' 2>/dev/null)
+    enabled=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+    label=$(echo "$input" | jsonfilter -e '@.label' 2>/dev/null)
+    dns_override=$(echo "$input" | jsonfilter -e '@.dns_override' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$device_id" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "device_id is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Check existence
+    local device_type
+    device_type=$(uci -q get mullvadvpn."$device_id")
+    if [ "$device_type" != "device" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Device not found"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    # Update provided fields (empty string is valid for tunnel = no VPN)
+    # We use a different check: whether the key exists in the JSON input
+    echo "$input" | jsonfilter -e '@.tunnel' >/dev/null 2>&1 && \
+        uci set mullvadvpn."$device_id".tunnel="$tunnel"
+    [ -n "$enabled" ] && uci set mullvadvpn."$device_id".enabled="$enabled"
+    [ -n "$label" ] && uci set mullvadvpn."$device_id".label="$label"
+    echo "$input" | jsonfilter -e '@.dns_override' >/dev/null 2>&1 && \
+        uci set mullvadvpn."$device_id".dns_override="$dns_override"
+
+    uci commit mullvadvpn
+    regenerate_pbr
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Device updated"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: deleteDevice
+# Removes a device from the configuration
+# ============================================================================
+delete_device() {
+    local input
+    read -r input
+
+    local device_id
+    device_id=$(echo "$input" | jsonfilter -e '@.device_id' 2>/dev/null)
+
+    json_init
+
+    if [ -z "$device_id" ]; then
+        json_add_boolean "success" 0
+        json_add_string "error" "device_id is required"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    if ! uci -q get mullvadvpn."$device_id" >/dev/null 2>&1; then
+        json_add_boolean "success" 0
+        json_add_string "error" "Device not found"
+        json_dump
+        json_cleanup
+        return
+    fi
+
+    uci delete mullvadvpn."$device_id"
+    uci commit mullvadvpn
+    regenerate_pbr
+
+    log_debug "Deleted device $device_id"
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Device deleted"
+
+    json_dump
+    json_cleanup
+}
+
+# ============================================================================
+# METHOD: applyChanges
+# Regenerates PBR policies and restarts required services
+# Wrapper for explicit call from the frontend
+# ============================================================================
+apply_changes() {
+    json_init
+
+    regenerate_pbr
+
+    json_add_boolean "success" 1
+    json_add_string "message" "Changes applied successfully"
+
+    json_dump
+    json_cleanup
+}
+
+_mark_our_policy() {
+    local section="$1"
+    local name
+    config_get name "$section" name ""
+
+    # Our policies start with the mvpn_ prefix
+    case "$name" in
+        ${PBR_POLICY_PREFIX}*)
+            to_delete="$to_delete $section"
+            ;;
+    esac
+}
+
+_create_policy_for_device() {
+    local section="$1"
+    local mac tunnel enabled
+
+    config_get mac "$section" mac ""
+    config_get tunnel "$section" tunnel ""
+    config_get enabled "$section" enabled "1"
+
+    # Skip if:
+    # - No tunnel assigned (empty string = no VPN)
+    # - Device disabled
+    [ -z "$tunnel" ] && return
+    [ "$enabled" != "1" ] && return
+
+    # Check that the tunnel exists and is enabled
+    local tunnel_enabled tunnel_interface
+    config_get tunnel_enabled "$tunnel" enabled "1"
+    config_get tunnel_interface "$tunnel" wg_interface ""
+
+    [ "$tunnel_enabled" != "1" ] && return
+    [ -z "$tunnel_interface" ] && return
+
+    # Create PBR policy
+    local policy_name="${PBR_POLICY_PREFIX}${section}"
+
+    # Use uci add to create an anonymous section
+    local policy_section
+    policy_section=$(uci add pbr policy)
+
+    uci set pbr."$policy_section".name="$policy_name"
+    uci set pbr."$policy_section".interface="$tunnel_interface"
+    uci set pbr."$policy_section".src_addr="$mac"
+    uci set pbr."$policy_section".enabled="1"
+
+    policies_created=$((policies_created + 1))
+
+    log_debug "Created PBR policy $policy_name: $mac -> $tunnel_interface"
+}
+
+# ============================================================================
+# MAIN DISPATCHER
+# Handles calls from rpcd
+# ============================================================================
+case "$1" in
+    # === LIST ===
+    # Returns the schema of available methods (for rpcd)
+    list)
+        cat <<'EOF'
+{
+    "getTunnels": {},
+    "getDevices": {},
+    "getOnlineHosts": {},
+    "getWireGuardInterfaces": {},
+    "getServers": {},
+    "getServersList": {},
+    "refreshServers": {},
+    "createTunnel": {
+        "label": "string",
+        "wg_interface": "string"
+    },
+    "updateTunnel": {
+        "tunnel_id": "string",
+        "label": "string",
+        "enabled": "boolean"
+    },
+    "deleteTunnel": {
+        "tunnel_id": "string"
+    },
+    "setTunnelServer": {
+        "tunnel_id": "string",
+        "server_hostname": "string"
+    },
+    "detectTunnelServer": {
+        "tunnel_id": "string",
+        "save": "boolean"
+    },
+    "addDevice": {
+        "mac": "string",
+        "label": "string"
+    },
+    "updateDevice": {
+        "device_id": "string",
+        "tunnel": "string",
+        "enabled": "boolean",
+        "label": "string",
+        "dns_override": "string"
+    },
+    "deleteDevice": {
+        "device_id": "string"
+    },
+    "applyChanges": {}
+}
+EOF
+        ;;
+
+    # === CALL ===
+    # Execute the requested method
+    call)
+        case "$2" in
+            getTunnels)
+                get_tunnels
+                ;;
+            getDevices)
+                get_devices
+                ;;
+            getOnlineHosts)
+                get_online_hosts
+                ;;
+            getWireGuardInterfaces)
+                get_wireguard_interfaces
+                ;;
+            getServers)
+                get_servers
+                ;;
+            getServersList)
+                get_servers_list
+                ;;
+            refreshServers)
+                refresh_servers
+                ;;
+            createTunnel)
+                create_tunnel
+                ;;
+            updateTunnel)
+                update_tunnel
+                ;;
+            deleteTunnel)
+                delete_tunnel
+                ;;
+            setTunnelServer)
+                set_tunnel_server
+                ;;
+            detectTunnelServer)
+                detect_tunnel_server
+                ;;
+            addDevice)
+                add_device
+                ;;
+            updateDevice)
+                update_device
+                ;;
+            deleteDevice)
+                delete_device
+                ;;
+            applyChanges)
+                apply_changes
+                ;;
+            *)
+                json_output_error "Unknown method: $2"
+                ;;
+        esac
+        ;;
+
+    *)
+        json_output_error "Unknown command: $1"
+        ;;
+esac
+
+exit 0

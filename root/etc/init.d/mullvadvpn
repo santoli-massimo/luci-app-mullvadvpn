@@ -1,0 +1,201 @@
+#!/bin/sh /etc/rc.common
+# Mullvad VPN Manager
+# - Syncs WireGuard peers with UCI config (via wg set, instantaneous)
+# - Generates PBR policies for device routing
+#
+# Non-procd script for compatibility with ucitrack
+
+START=99
+STOP=10
+
+# Syncs WireGuard peers with the UCI config
+# Uses "wg set" for an instantaneous change without restarting the interface
+sync_wg_peers() {
+    config_load mullvadvpn
+    # Do NOT run config_load network - it overwrites the context!
+    # _sync_tunnel_peer uses "uci get" directly to read network
+
+    config_foreach _sync_tunnel_peer tunnel
+}
+
+_sync_tunnel_peer() {
+    local section="$1"
+    local wg_interface enabled
+
+    config_get wg_interface "$section" wg_interface ""
+    config_get enabled "$section" enabled "1"
+
+    [ -z "$wg_interface" ] && return
+    [ "$enabled" != "1" ] && return
+
+    # Read peer config from UCI
+    local uci_pubkey uci_endpoint uci_port
+    uci_pubkey=$(uci -q get network.@wireguard_${wg_interface}[0].public_key)
+    uci_endpoint=$(uci -q get network.@wireguard_${wg_interface}[0].endpoint_host)
+    uci_port=$(uci -q get network.@wireguard_${wg_interface}[0].endpoint_port)
+
+    [ -z "$uci_pubkey" ] && return
+    [ -z "$uci_endpoint" ] && return
+    [ -z "$uci_port" ] && uci_port="51820"
+
+    # Read current peer from the kernel
+    local kernel_pubkey
+    kernel_pubkey=$(wg show "$wg_interface" peers 2>/dev/null | head -1)
+
+    # If the peer is different, update it
+    if [ "$kernel_pubkey" != "$uci_pubkey" ]; then
+        # Remove old peer if it exists
+        if [ -n "$kernel_pubkey" ]; then
+            wg set "$wg_interface" peer "$kernel_pubkey" remove 2>/dev/null
+            logger -t mullvadvpn "Removed old peer $kernel_pubkey from $wg_interface"
+        fi
+
+        # Add new peer
+        wg set "$wg_interface" peer "$uci_pubkey" \
+            endpoint "${uci_endpoint}:${uci_port}" \
+            allowed-ips "0.0.0.0/0,::/0" \
+            persistent-keepalive 25 2>/dev/null
+
+        logger -t mullvadvpn "Set peer $uci_pubkey on $wg_interface (endpoint ${uci_endpoint}:${uci_port})"
+    else
+        # Same peer, but check whether the endpoint has changed
+        local kernel_endpoint
+        kernel_endpoint=$(wg show "$wg_interface" endpoints 2>/dev/null | grep "$uci_pubkey" | awk '{print $2}')
+
+        if [ "$kernel_endpoint" != "${uci_endpoint}:${uci_port}" ]; then
+            wg set "$wg_interface" peer "$uci_pubkey" \
+                endpoint "${uci_endpoint}:${uci_port}" 2>/dev/null
+
+            logger -t mullvadvpn "Updated endpoint for $uci_pubkey to ${uci_endpoint}:${uci_port}"
+        fi
+    fi
+}
+
+# Global variables for building policy lists
+_expected_policies=""
+_actual_policies=""
+
+# Builds the list of desired policies from the mullvadvpn config
+_build_expected_policy() {
+    local section="$1"
+    local mac tunnel enabled
+
+    config_get mac "$section" mac ""
+    config_get tunnel "$section" tunnel ""
+    config_get enabled "$section" enabled "1"
+
+    [ -z "$mac" ] && return
+    [ -z "$tunnel" ] && return
+    [ "$enabled" != "1" ] && return
+
+    local wg_interface
+    config_get wg_interface "$tunnel" wg_interface ""
+    [ -z "$wg_interface" ] && return
+
+    local tunnel_enabled
+    config_get tunnel_enabled "$tunnel" enabled "1"
+    [ "$tunnel_enabled" != "1" ] && return
+
+    local mac_normalized=$(echo "$mac" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+    # Traffic + DNS policy (same base name)
+    local policy_name="mvpn_${mac_normalized}_${wg_interface}"
+    _expected_policies="${_expected_policies}${policy_name}\n"
+    _expected_policies="${_expected_policies}${policy_name}_dns\n"
+}
+
+# Actually creates a PBR policy
+_create_pbr_policy() {
+    local section="$1"
+    local mac tunnel enabled
+
+    config_get mac "$section" mac ""
+    config_get tunnel "$section" tunnel ""
+    config_get enabled "$section" enabled "1"
+
+    [ -z "$mac" ] && return
+    [ -z "$tunnel" ] && return
+    [ "$enabled" != "1" ] && return
+
+    local wg_interface
+    config_get wg_interface "$tunnel" wg_interface ""
+    [ -z "$wg_interface" ] && return
+
+    local tunnel_enabled
+    config_get tunnel_enabled "$tunnel" enabled "1"
+    [ "$tunnel_enabled" != "1" ] && return
+
+    local mac_normalized=$(echo "$mac" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+
+    # Traffic policy
+    local policy_name="mvpn_${mac_normalized}_${wg_interface}"
+    uci set pbr.${policy_name}=policy
+    uci set pbr.${policy_name}.name="$policy_name"
+    uci set pbr.${policy_name}.interface="$wg_interface"
+    uci set pbr.${policy_name}.src_addr="$mac"
+    uci set pbr.${policy_name}.enabled="1"
+
+    # DNS Policy (to avoid DNS leaks - forces Mullvad DNS)
+    uci set pbr.${policy_name}_dns=dns_policy
+    uci set pbr.${policy_name}_dns.name="$policy_name"
+    uci set pbr.${policy_name}_dns.src_addr="$mac"
+    uci set pbr.${policy_name}_dns.dest_dns="10.64.0.1"
+    uci set pbr.${policy_name}_dns.enabled="1"
+}
+
+generate_pbr_policies() {
+    # Build the list of desired policies
+    _expected_policies=""
+    config_load mullvadvpn
+    config_foreach _build_expected_policy device
+    local expected=$(printf "%b" "$_expected_policies" | sort | tr '\n' ' ' | xargs)
+
+    # Build the list of current policies (mvpn_*)
+    local actual=$(uci show pbr 2>/dev/null | grep "\.name='mvpn_" | \
+        sed "s/.*\.name='\([^']*\)'.*/\1/" | sort | tr '\n' ' ' | xargs)
+
+    # Compare
+    if [ "$expected" = "$actual" ]; then
+        logger -t mullvadvpn "PBR policies unchanged, skipping reload"
+        return
+    fi
+
+    logger -t mullvadvpn "PBR policies changed: expected=[$expected] actual=[$actual]"
+
+    # Remove existing policies with the mvpn_ prefix
+    local section
+    for section in $(uci show pbr 2>/dev/null | grep "\.name='mvpn_" | cut -d. -f2 | cut -d= -f1); do
+        uci -q delete pbr.$section
+    done
+
+    # Recreate policies
+    config_foreach _create_pbr_policy device
+
+    uci commit pbr
+
+    # Reload PBR only if there are policies to apply or remove
+    if [ -x /etc/init.d/pbr ]; then
+        /etc/init.d/pbr reload
+        logger -t mullvadvpn "PBR reloaded with new policies"
+    fi
+}
+
+start() {
+    generate_pbr_policies
+}
+
+stop() {
+    local section
+    for section in $(uci show pbr 2>/dev/null | grep "\.name='mvpn_" | cut -d. -f2 | cut -d= -f1); do
+        uci -q delete pbr.$section
+    done
+    uci commit pbr
+    [ -x /etc/init.d/pbr ] && /etc/init.d/pbr reload
+}
+
+reload() {
+    # Sync WireGuard peers with UCI (instantaneous via wg set)
+    sync_wg_peers
+    # Regenerate PBR policies
+    generate_pbr_policies
+}
